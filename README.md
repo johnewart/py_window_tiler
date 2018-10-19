@@ -29,6 +29,15 @@ Probably not currently, but if you are brave then feel free. It is horribly
 unoptimized but it works for my use right now and it's the first time I've 
 ever used Xlib. This is what you get for two hours of hacking...
 
+## Things to do ... 
+
+* Clean up layout abstraction (really hacky currently...) 
+* Support per-virtual desktop layouts
+* Add configuration options (right now some hard-coded things like
+  layout-per-resolution) 
+* Allow for gaps (so you can see your pretty desktop background sometimes!)
+
+
 ## Contributing
 
 If you want to contribute, feel free to open a pull request
