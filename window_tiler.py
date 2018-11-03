@@ -2,9 +2,27 @@ from Xlib.display import Display
 from Xlib import X, Xatom
 from Xlib.ext import randr
 import Xlib
-
+import logging
 import pprint
+import sys
+
 pp = pprint.PrettyPrinter(indent=4)
+
+LOGGER = logging.getLogger('window_tiler')
+LOGGER.setLevel(logging.DEBUG)
+
+formatter = logging.Formatter('%(asctime)-15s %(message)s')
+
+#fh = logging.FileHandler(filename="window_tiler.log")
+#fh.setLevel(logging.DEBUG)
+#fh.setFormatter(formatter)
+#LOGGER.addHandler(fh)
+
+
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.DEBUG)
+ch.setFormatter(formatter)
+LOGGER.addHandler(ch)
 
 class Region():
     def __init__(self, x, y, width, height):
@@ -29,6 +47,7 @@ class RowLayout():
             region = Region(x = 0, y = 0, width = 0, height = 0)
         self.region = region
         self.windows = []
+        self.wnd_top_padding=36
 
     def window_count(self):
         return len(self.windows)
@@ -59,22 +78,21 @@ class RowLayout():
 
     def redraw(self):
         if len(self.windows) > 0:
-            cell_height = (self.region.height / len(self.windows)) - self.window_top_padding()
+            cell_height = (self.region.height / len(self.windows))
             cell_width = self.region.width 
             vertical_gap = self.get_vertical_gap()
-            
+            window_height = cell_height - self.window_top_padding() 
             x = self.region.x
             y = self.region.y 
 
             for window in self.windows:
-                print("Resizing window %s to %d x %d @ %d, %d" % (window, cell_width,
-                    cell_height, x, y))
+                LOGGER.debug("Resizing window %s to %d x %d @ %d, %d" % (window, cell_width, window_height, x, y))
                 window.configure(width = cell_width, 
-                                 height = cell_height,
+                                 height = window_height,
                                  x = x, y = y)
                 y = y + cell_height + self.window_top_padding()
 
-# Three column layout,66/33 
+# Two column layout,66/33 
 class TwoColumnLayout():
 
     LEFT = 0
@@ -126,7 +144,7 @@ class TwoColumnLayout():
             col.remove_window(window)
     
     def redraw(self):
-        print("Screen width: %d" % (self.region.width))
+        #LOGGER.debug("Screen width: %d" % (self.region.width))
         left_col = self.columns[self.LEFT]
         right_col = self.columns[self.RIGHT]
         column_height = self.region.height
@@ -178,6 +196,13 @@ class ThreeColumnLayout():
             count = count + col.window_count()
         return count 
 
+    def window_top_padding(self):
+        try:
+            return 24
+        except AttributeError:
+            return self.parent_layout.window_top_padding()
+
+
     # Add to middle column, only one, then add to sides, left then right...
     def add_window(self, window):
         left = self.columns[self.LEFT]
@@ -199,6 +224,8 @@ class ThreeColumnLayout():
     def remove_window(self, window):
         for col in self.columns:
             col.remove_window(window)
+
+
     
     def redraw(self):
         column_height = self.region.height
@@ -223,6 +250,13 @@ class ThreeColumnLayout():
         
         return None
 
+class Window():
+
+    def __init__(self, id, region, desktop, visible = True):
+        self.region = region 
+        self.desktop = desktop
+        self.visible = visible
+
 class Environment():
 
     
@@ -235,10 +269,11 @@ class Environment():
         self.desktops = []
         self.windows = self.get_window_set()
         self.window_desktop_map = {}
-
+        self.hidden_windows = set()
+        self.visible_windows = set()
      
         for i in range(self.number_of_desktops()):
-            print("\n\n\nCreating Desktop %d" % (i))
+            LOGGER.debug("\n\n\nCreating Desktop %d" % (i))
             d = Desktop(i, self)
             self.desktops.append(d)
             #d.print_windows()
@@ -271,7 +306,7 @@ class Environment():
         self.region = Region(x = 0, y = 0, width = self.screen.width_in_pixels,
                 height = self.screen.height_in_pixels - 32)
 
-        print("NEW REGION: %s" % (self.region))
+        LOGGER.debug("NEW REGION: %s" % (self.region))
         
         for d in self.desktops:
             d.resize()
@@ -281,15 +316,15 @@ class Environment():
     def print_hierarchy(self, window, indent):
         children = window.query_tree().children
         for w in children:
-            print(indent, window.get_wm_class())
+            LOGGER.debug(indent, window.get_wm_class())
             self.print_hierarchy(w, indent+'-')
 
 
     def interesting_properties(self):
         #_NET_WM_DESKTOP
         # root: _NET_CURRENT_DESKTOP
-        print("Current desktop")
-        print(self.root.get_full_property(self.display.intern_atom('_NET_CURRENT_DESKTOP'),
+        LOGGER.debug("Current desktop")
+        LOGGER.debug(self.root.get_full_property(self.display.intern_atom('_NET_CURRENT_DESKTOP'),
             Xatom.CARDINAL).value[0])
 
     def current_desktop(self):
@@ -298,10 +333,19 @@ class Environment():
     def number_of_desktops(self):
         return self.root.get_full_property(self.display.intern_atom('_NET_NUMBER_OF_DESKTOPS'), Xatom.CARDINAL).value[0]
 
+    def update_window_states(self):
+        window_ids = self.get_window_set(include_hidden=True)
+        for window_id in window_ids:
+            if self.is_window_hidden(window_id):
+                self.hidden_windows.add(window_id)
+            else:
+                self.visible_windows.add(window_id)
+
+
     def update_desktop_map(self):
         self.window_desktop_map = {}
         for d in self.desktops:
-            for window_id in d.get_window_set():
+            for window_id in d.get_window_set(include_hidden=True):
                 self.window_desktop_map[window_id] = d
 
     def get_window_desktop(self, window):
@@ -322,58 +366,80 @@ class Environment():
         except Xlib.error.BadWindow:
             return None
 
-    def get_window_states(self, window):
-        w = self.display.create_resource_object('window', window)
+    def get_window_states(self, window_id):
+        w = self.display.create_resource_object('window', window_id)
         #return w.get_full_property(self.display.intern_atom('_NET_WM_STATE'), Xatom.ATOM).value
         try:
-	    states = w.get_full_property(self.display.get_atom('_NET_WM_STATE'), Xatom.WINDOW)
+            states = w.get_full_property(self.display.get_atom('_NET_WM_STATE'), Xatom.WINDOW)
         except Xlib.error.BadWindow:
+            LOGGER.warn("Bad window fetching states...")
             states = None
 
-	if states == None:
+        if states == None:
             return []
         else:
-            return w.get_full_property(self.display.get_atom('_NET_WM_STATE'), 0).value.tolist()
+            res = w.get_full_property(self.display.get_atom('_NET_WM_STATE'), 0).value.tolist()
+            return res
 
-    def is_window_hidden(self, window):
-        states = self.get_window_states(window)
-        hidden = self.display.get_atom("_NET_WM_STATE_HIDDEN") in states
-        #print("Window %d is hidden: %s" % (window, hidden))
-        return hidden
+    def is_window_hidden(self, window_id):
+        hidden_state_atom = self.display.get_atom("_NET_WM_STATE_HIDDEN")
+        states = self.get_window_states(window_id)
+        return hidden_state_atom in states
 
-    def is_window_visible(self, window):
-        return not self.is_window_hidden(window)
+    def is_window_visible(self, window_id):
+        return not self.is_window_hidden(window_id)
 
 
     def listen_for_events(self):
-        print("Listening for change events!")
+        LOGGER.debug("Listening for change events!")
         while True:
             ev = self.display.next_event()
             self.handle_event(ev)
 
     def handle_event(self, event):
+        old_hidden = set(self.hidden_windows)
+        old_visible = set(self.visible_windows)
+        self.update_window_states()
+        changed_ids = set()
+        changed_ids.update(old_hidden.symmetric_difference(self.hidden_windows))
+        changed_ids.update(old_visible.symmetric_difference(self.visible_windows))
+
+        if len(changed_ids) > 0:
+            LOGGER.debug("Changed IDs: %s" % (changed_ids)) 
+    
         needs_update = False
 
-	wm_active_window = self.display.get_atom('_NET_ACTIVE_WINDOW')
+        wm_active_window = self.display.get_atom('_NET_ACTIVE_WINDOW')
+        wm_move_window = self.display.get_atom('_NET_MOVERESIZE_WINDOW')
+        wm_hidden_window = self.display.get_atom('_NET_WM_STATE_HIDDEN')
+        wm_state = self.display.get_atom('_NET_WM_STATE')
+      
+        try: 
+            window_props = event.window.get_full_property(event.atom, 0)
+            window_id = int(window_props.value.tolist()[0])
+            LOGGER.debug("Window ID: %s" % (window_id))
+        except AttributeError:
+            pass
+            #LOGGER.debug("Not a window-level event")
+
+        for window_id in changed_ids:
+            desktop = self.window_desktop_map.get(window_id, None)
+            LOGGER.debug("Window changed: %s on desktop: %s" % (window_id, desktop))
+            if desktop is not None: 
+                desktop.arrange()
+                needs_update = True         
 
         if event.type == X.PropertyNotify:
-            print("Property changed...")
+            LOGGER.debug("Property changed...")
             if event.atom == wm_active_window:
-                print("Property changed on an active window....")
-                data = event.window.get_full_property(event.atom, 0)
-                window_id = int(data.value.tolist()[0])
-                desktop = self.window_desktop_map.get(window_id, None)
-                print("Window changed: %s on desktop: %s" % (window_id, desktop))
-                if desktop is not None: 
-                    desktop.arrange()
-                    needs_update = True         
-               
+                LOGGER.debug("Property changed on an active window....")
+                 
         elif event.type == X.CreateNotify or event.type == X.DestroyNotify:
             needs_update = True
             window_set = self.get_window_set()
 
             if event.type == X.CreateNotify:
-                print("Handling creation!")
+                LOGGER.debug("Handling creation!")
                 new_windows = window_set.difference(self.windows)
                 for window in new_windows:
                     window_resource = self.display.create_resource_object('window', window)
@@ -382,12 +448,13 @@ class Environment():
                         self.desktops[window_desktop].layout.add_window(window_resource)
 
             if event.type == X.DestroyNotify:
-                print("Handling destruction!")
+                LOGGER.debug("Handling destruction!")
                 missing_windows = self.windows.difference(window_set)
                 for window in missing_windows:
                     window_resource = self.display.create_resource_object('window', window)
                     # TODO: optimize lookup by keeping old map?
                     for desktop in self.desktops:
+                        LOGGER.debug("Trying to remove from desktop %s" % (desktop))
                         desktop.layout.remove_window(window_resource)
 
             self.windows = window_set
@@ -396,12 +463,11 @@ class Environment():
                 desktop.layout.redraw()
        
         elif event.__class__.__name__ == randr.ScreenChangeNotify.__name__:
-            print('Screen change')
-            print(pp.pprint(event._data))
+            LOGGER.debug('Screen change')
             self.update_all_the_things()
 
         else:
-            #print("Unhandled event: %d" % (event.type))
+            #LOGGER.debug("Unhandled event: %d" % (event.type))
             pass
 
         if needs_update:
@@ -412,15 +478,16 @@ class Environment():
         windows = set([x for x in self.root.get_full_property(self.display.intern_atom('_NET_CLIENT_LIST'), Xatom.WINDOW).value])
 
         if desktop_number is not None:
-            #print("Filtering windows not on: %d" % (desktop_number))
+            #LOGGER.debug("Filtering windows not on: %d" % (desktop_number))
             windows = filter(lambda w: self.get_window_desktop(w) == desktop_number, windows)
    
         if include_hidden is False:
-            #print("Filtering hidden windows...")
+            #LOGGER.debug("Filtering hidden windows...")
             windows = filter(lambda w: self.is_window_visible(w) == True, windows)
 
         return set(windows)
 
+# TODO: Add per-desktop layouts
 class Desktop():
     def __init__(self, desktop_number, environment):
         self.environment = environment
@@ -431,6 +498,10 @@ class Desktop():
         self.region = environment.region
         self.update_layout()
 
+    def handle_event(self, event):
+        pass
+
+
     def update_layout(self):
         if self.region.width <= 1920:
             self.layout = TwoColumnLayout(region = self.region, parent_layout = None)
@@ -440,13 +511,13 @@ class Desktop():
 
 
     def print_windows(self):
-        print("Windows on desktop %d" % (self.desktop_number))
+        LOGGER.debug("Windows on desktop %d" % (self.desktop_number))
         for window in self.get_window_set():
             w = self.display.create_resource_object('window', window)
             try:
-                print("Window: %s (%s)" % (w.get_wm_name(), w.get_wm_class()))
+                LOGGER.debug("Window: %s (%s)" % (w.get_wm_name(), w.get_wm_class()))
             except UnicodeDecodeError:
-                print("Failed on %s" % (window))
+                LOGGER.debug("Failed on %s" % (window))
    
     def resize(self):
         self.display = self.environment.display
@@ -456,18 +527,18 @@ class Desktop():
         self.arrange()
         
     def arrange(self):
-        print("Rearranging with region: %s" % (self.region))
+        LOGGER.debug("Rearranging with region: %s" % (self.region))
         self.update_layout()
         window_areas = []
 
-        print("Arranging windows on desktop: %d" % (self.desktop_number))
+        LOGGER.debug("Arranging windows on desktop: %d" % (self.desktop_number))
 
         for window in self.get_window_set():
             w = self.display.create_resource_object('window', window)
             geom = w.get_geometry()
             window_areas.append({'window': w, 'area': (geom.height *
                 geom.width)})
-            #print("Geometry: %s" % geom)
+            #LOGGER.debug("Geometry: %s" % geom)
 
         window_areas.sort(key=lambda x: x['area'], reverse=True)
 
@@ -478,9 +549,11 @@ class Desktop():
 
         self.layout.redraw()
 
-    def get_window_set(self):
-        return self.environment.get_window_set(desktop_number=self.desktop_number)
+    def get_window_set(self, include_hidden=False):
+        return self.environment.get_window_set(include_hidden=include_hidden, desktop_number=self.desktop_number)
 
-e = Environment()
-e.listen_for_events()
+if __name__ == '__main__':
+    e = Environment()
+    e.listen_for_events()
+
 
