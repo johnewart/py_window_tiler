@@ -1,0 +1,11 @@
+dependencies:
+  build:
+    - python:3.6.3
+  runtime:
+    - python:3.6.3
+build:
+  commands:
+    - python -c "print('hello')"
+exec:
+  commands:
+    - python tiler.py
